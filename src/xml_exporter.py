@@ -1,0 +1,362 @@
+# -*- coding: utf-8 -*-
+import os
+import json
+import cv2
+from pathlib import Path
+from typing import List, Dict
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom import minidom
+from utils import load_config
+
+
+def get_video_info(video_path: str) -> Dict:
+    """
+    Получает информацию о видео
+    
+    Args:
+        video_path: Путь к видео
+    
+    Returns:
+        Словарь с параметрами видео
+    """
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        raise IOError(f"Не удалось открыть видео: {video_path}")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    cap.release()
+    
+    return {
+        'fps': fps,
+        'width': width,
+        'height': height,
+        'duration': duration,
+        'total_frames': total_frames
+    }
+
+
+def get_audio_info(audio_path: str) -> Dict:
+    """
+    Получает информацию об аудио файле
+    
+    Args:
+        audio_path: Путь к аудио
+    
+    Returns:
+        Словарь с параметрами аудио
+    """
+    cap = cv2.VideoCapture(audio_path)
+    
+    if cap.isOpened():
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30  # fallback
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps > 0 else 0
+        cap.release()
+        return {'duration': duration, 'fps': fps}
+    
+    # Fallback: берем из последнего элемента edit_plan
+    return {'duration': 0, 'fps': 30}
+
+
+def load_scene_index(cache_dir: Path) -> List[Dict]:
+    """Загружает индекс сцен"""
+    index_file = cache_dir / "scene_index.json"
+    
+    if not index_file.exists():
+        raise FileNotFoundError(f"Индекс сцен не найден: {index_file}")
+    
+    with open(index_file, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def create_premiere_xml(edit_plan: List[Dict], scene_index: List[Dict], 
+                        video_info: Dict, video_path: str, audio_path: str) -> str:
+    """
+    Создаёт Final Cut Pro 7 XML (совместимый с Premiere Pro)
+    
+    Args:
+        edit_plan: План монтажа
+        scene_index: Индекс сцен
+        video_info: Информация о видео
+        video_path: Путь к исходному видео
+        audio_path: Путь к аудио озвучки
+    
+    Returns:
+        XML строка
+    """
+    fps = int(video_info['fps'])
+    width = video_info['width']
+    height = video_info['height']
+    
+    # Создаём карту scene_id -> scene
+    scene_map = {scene['id']: scene for scene in scene_index}
+    
+    # Корневой элемент
+    xmeml = Element('xmeml', version="4")
+    
+    # Проект
+    project = SubElement(xmeml, 'project')
+    SubElement(project, 'name').text = "SculptorPro"
+    
+    # Последовательность
+    sequence = SubElement(project, 'children')
+    seq = SubElement(sequence, 'sequence', id="sequence-1")
+    
+    SubElement(seq, 'uuid').text = "sculptor-sequence-001"
+    SubElement(seq, 'name').text = "SculptorPro_Timeline"
+    SubElement(seq, 'duration').text = str(int(edit_plan[-1]['end'] * fps))
+    
+    # Rate
+    rate = SubElement(seq, 'rate')
+    SubElement(rate, 'timebase').text = str(fps)
+    SubElement(rate, 'ntsc').text = 'FALSE'
+    
+    # Timecode
+    timecode = SubElement(seq, 'timecode')
+    SubElement(timecode, 'rate')
+    tc_rate = timecode.find('rate')
+    SubElement(tc_rate, 'timebase').text = str(fps)
+    SubElement(tc_rate, 'ntsc').text = 'FALSE'
+    SubElement(timecode, 'string').text = '00:00:00:00'
+    SubElement(timecode, 'frame').text = '0'
+    SubElement(timecode, 'displayformat').text = 'NDF'
+    
+    # Media
+    media = SubElement(seq, 'media')
+    
+    # === VIDEO TRACK ===
+    video = SubElement(media, 'video')
+    video_format = SubElement(video, 'format')
+    SubElement(video_format, 'samplecharacteristics')
+    sc = video_format.find('samplecharacteristics')
+    
+    sc_rate = SubElement(sc, 'rate')
+    SubElement(sc_rate, 'timebase').text = str(fps)
+    SubElement(sc_rate, 'ntsc').text = 'FALSE'
+    
+    SubElement(sc, 'width').text = str(width)
+    SubElement(sc, 'height').text = str(height)
+    SubElement(sc, 'pixelaspectratio').text = 'square'
+    SubElement(sc, 'fielddominance').text = 'none'
+    
+    # Video Track
+    video_track = SubElement(video, 'track')
+    
+    # === AUDIO TRACK ===
+    audio = SubElement(media, 'audio')
+    audio_format = SubElement(audio, 'format')
+    SubElement(audio_format, 'samplecharacteristics')
+    asc = audio_format.find('samplecharacteristics')
+    SubElement(asc, 'depth').text = '16'
+    SubElement(asc, 'samplerate').text = '48000'
+    
+    # Audio Tracks (2 channels)
+    audio_track_1 = SubElement(audio, 'track')
+    audio_track_2 = SubElement(audio, 'track')
+    
+    # Добавляем видео клипы
+    # ВАЖНО: используем точные временные метки из транскрипта для синхронизации
+    
+    for i, item in enumerate(edit_plan):
+        scene_id = item.get('scene_id')
+        phrase_start = item['start']  # Точное время начала фразы в аудио
+        phrase_end = item['end']      # Точное время конца фразы в аудио
+        phrase_duration = phrase_end - phrase_start
+        
+        # Конвертируем в кадры
+        timeline_start_frame = int(phrase_start * fps)
+        timeline_end_frame = int(phrase_end * fps)
+        phrase_frames = timeline_end_frame - timeline_start_frame
+        
+        if scene_id is None or scene_id not in scene_map:
+            print(f"⚠️ Пропускаем фразу {i}: scene_id={scene_id} не найден")
+            continue
+        
+        scene = scene_map[scene_id]
+        
+        # Видео клип
+        clip = SubElement(video_track, 'clipitem', id=f"clipitem-{i+1}")
+        SubElement(clip, 'masterclipid').text = f"masterclip-{scene_id}"
+        SubElement(clip, 'name').text = f"Scene_{scene_id}"
+        
+        # Enabled
+        SubElement(clip, 'enabled').text = 'TRUE'
+        SubElement(clip, 'duration').text = str(phrase_frames)
+        
+        # Rate
+        clip_rate = SubElement(clip, 'rate')
+        SubElement(clip_rate, 'timebase').text = str(fps)
+        SubElement(clip_rate, 'ntsc').text = 'FALSE'
+        
+        # Входная/выходная точка в исходнике (берем из середины сцены)
+        scene_in_frames = int(scene['start_time'] * fps)
+        scene_out_frames = scene_in_frames + phrase_frames
+        
+        # КРИТИЧЕСКИ ВАЖНО: позиция на таймлайне = точное время из транскрипта
+        SubElement(clip, 'start').text = str(timeline_start_frame)
+        SubElement(clip, 'end').text = str(timeline_end_frame)
+        SubElement(clip, 'in').text = str(scene_in_frames)
+        SubElement(clip, 'out').text = str(scene_out_frames)
+        
+        # File reference
+        file_elem = SubElement(clip, 'file', id=f"file-{scene_id}")
+        SubElement(file_elem, 'name').text = os.path.basename(video_path)
+        SubElement(file_elem, 'pathurl').text = f"file://localhost/{os.path.abspath(video_path).replace(chr(92), '/')}"
+        
+        file_rate = SubElement(file_elem, 'rate')
+        SubElement(file_rate, 'timebase').text = str(fps)
+        SubElement(file_rate, 'ntsc').text = 'FALSE'
+        
+        SubElement(file_elem, 'duration').text = str(video_info['total_frames'])
+        
+        # Media
+        file_media = SubElement(file_elem, 'media')
+        file_video = SubElement(file_media, 'video')
+        SubElement(file_video, 'samplecharacteristics')
+        fsc = file_video.find('samplecharacteristics')
+        
+        fsc_rate = SubElement(fsc, 'rate')
+        SubElement(fsc_rate, 'timebase').text = str(fps)
+        SubElement(fsc_rate, 'ntsc').text = 'FALSE'
+        
+        SubElement(fsc, 'width').text = str(width)
+        SubElement(fsc, 'height').text = str(height)
+    
+    # Аудио клип (вся озвучка) - привязан к точному времени
+    total_audio_frames = int(edit_plan[-1]['end'] * fps)
+    
+    for track_idx, audio_track in enumerate([audio_track_1, audio_track_2]):
+        audio_clip = SubElement(audio_track, 'clipitem', id=f"audio-{track_idx+1}")
+        SubElement(audio_clip, 'masterclipid').text = "audio-master-1"
+        SubElement(audio_clip, 'name').text = "Voiceover"
+        
+        SubElement(audio_clip, 'enabled').text = 'TRUE'
+        SubElement(audio_clip, 'duration').text = str(total_audio_frames)
+        SubElement(audio_clip, 'start').text = '0'
+        SubElement(audio_clip, 'end').text = str(total_audio_frames)
+        SubElement(audio_clip, 'in').text = '0'
+        SubElement(audio_clip, 'out').text = str(total_audio_frames)
+        
+        # File
+        audio_file = SubElement(audio_clip, 'file', id="audio-file-1")
+        SubElement(audio_file, 'name').text = os.path.basename(audio_path)
+        SubElement(audio_file, 'pathurl').text = f"file://localhost/{os.path.abspath(audio_path).replace(chr(92), '/')}"
+        
+        audio_rate = SubElement(audio_file, 'rate')
+        SubElement(audio_rate, 'timebase').text = str(fps)
+        SubElement(audio_rate, 'ntsc').text = 'FALSE'
+        
+        SubElement(audio_file, 'duration').text = str(total_audio_frames)
+        
+        # Audio Media
+        audio_media = SubElement(audio_file, 'media')
+        audio_elem = SubElement(audio_media, 'audio')
+        SubElement(audio_elem, 'samplecharacteristics')
+        asc_clip = audio_elem.find('samplecharacteristics')
+        SubElement(asc_clip, 'depth').text = '16'
+        SubElement(asc_clip, 'samplerate').text = '48000'
+        
+        # Source track
+        SubElement(audio_clip, 'sourcetrack')
+        st = audio_clip.find('sourcetrack')
+        SubElement(st, 'mediatype').text = 'audio'
+        SubElement(st, 'trackindex').text = str(track_idx + 1)
+    
+    # Форматирование XML
+    xml_string = tostring(xmeml, encoding='unicode')
+    dom = minidom.parseString(xml_string)
+    pretty_xml = dom.toprettyxml(indent="  ", encoding=None)
+    
+    # Убираем лишние пустые строки
+    lines = [line for line in pretty_xml.split('\n') if line.strip()]
+    return '\n'.join(lines)
+
+
+def export_to_premiere():
+    """Основная функция экспорта"""
+    cfg = load_config()
+    
+    cache_dir = Path(cfg['paths']['cache_dir'])
+    edit_plan_file = cache_dir / "edit_plan.json"
+    output_xml = Path(cfg['paths']['output_video']).parent / "premiere_project.xml"
+    
+    video_path = cfg['paths']['input_video']
+    audio_path = cfg['paths']['input_audio']
+    
+    print("🎬 SculptorPro - XML Exporter\n")
+    print("="*60)
+    
+    # Проверка файлов
+    if not edit_plan_file.exists():
+        print(f"❌ План монтажа не найден: {edit_plan_file}")
+        print("   Запусти сначала: python src/smart_matcher.py")
+        return
+    
+    if not os.path.exists(video_path):
+        print(f"❌ Исходное видео не найдено: {video_path}")
+        return
+    
+    if not os.path.exists(audio_path):
+        print(f"❌ Аудио озвучки не найдено: {audio_path}")
+        return
+    
+    print("📂 Загружаем данные...")
+    
+    # Загрузка данных
+    with open(edit_plan_file, 'r', encoding='utf-8') as f:
+        edit_plan = json.load(f)
+    
+    scene_index = load_scene_index(cache_dir)
+    
+    print(f"   ✅ План монтажа: {len(edit_plan)} фраз")
+    print(f"   ✅ Индекс сцен: {len(scene_index)} сцен")
+    
+    # Получаем информацию о видео
+    print("\n🎥 Анализируем видео...")
+    video_info = get_video_info(video_path)
+    
+    print(f"   Разрешение: {video_info['width']}x{video_info['height']}")
+    print(f"   FPS: {video_info['fps']:.2f}")
+    print(f"   Длительность: {video_info['duration']:.1f}s")
+    
+    # Создание XML
+    print("\n📝 Генерируем Final Cut Pro 7 XML...")
+    
+    xml_content = create_premiere_xml(
+        edit_plan, 
+        scene_index, 
+        video_info, 
+        video_path, 
+        audio_path
+    )
+    
+    # Сохранение
+    with open(output_xml, 'w', encoding='utf-8') as f:
+        f.write(xml_content)
+    
+    print(f"\n✅ XML проект создан: {output_xml}")
+    print(f"   Клипов на таймлайне: {len(edit_plan)}")
+    print(f"   Общая длительность: {edit_plan[-1]['end']:.1f}s")
+    
+    print("\n📌 Как импортировать в Premiere Pro:")
+    print("   1. File → Import...")
+    print(f"   2. Выбери файл: {output_xml.name}")
+    print("   3. Sequence появится в Project Panel")
+    print("   4. Двойной клик - откроется Timeline")
+    
+    print("\n💡 Альтернативный способ:")
+    print("   File → Import → Final Cut Pro XML...")
+    
+    print("\n⚠️ Важно: Исходные файлы должны быть доступны:")
+    print(f"   📹 {video_path}")
+    print(f"   🎤 {audio_path}")
+
+
+if __name__ == "__main__":
+    export_to_premiere()

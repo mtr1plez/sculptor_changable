@@ -1,0 +1,22 @@
+current_project: The Silence of The Lambs
+models:
+  clip_model: clip-ViT-B-32
+  device: cpu
+  whisper_size: small
+params:
+  image_size: 224
+  min_scene_duration: 1.5
+  scene_threshold: 27.0
+paths:
+  cache_dir: /Users/morgana/Documents/sculptor_v1.0-main/data/projects/The Silence
+    of The Lambs/cache
+  frames_dir: /Users/morgana/Documents/sculptor_v1.0-main/data/projects/The Silence
+    of The Lambs/cache/frames
+  input_audio: /Users/morgana/Documents/sculptor_v1.0-main/data/projects/The Silence
+    of The Lambs/input/voice.mp3
+  input_video: /Users/morgana/Documents/sculptor_v1.0-main/data/projects/The Silence
+    of The Lambs/input/movie.mp4
+  output_video: /Users/morgana/Documents/sculptor_v1.0-main/data/projects/The Silence
+    of The Lambs/output/final_result.mp4
+  project_root: /Users/morgana/Documents/sculptor_v1.0-main/data/projects/The Silence
+    of The Lambs

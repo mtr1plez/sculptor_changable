@@ -1,0 +1,11 @@
+pyyaml
+tqdm
+opencv-python
+numpy
+torch
+sentence-transformers
+scenedetect[opencv]==0.6.2
+pillow
+google-generativeai
+python-dotenv
+google-generativeai>=0.3.0
