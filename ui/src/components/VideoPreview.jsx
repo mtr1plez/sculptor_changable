@@ -9,6 +9,7 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
   const [sceneMap, setSceneMap] = useState({});
   const [currentClipIndex, setCurrentClipIndex] = useState(0);
   const [muted, setMuted] = useState(false);
+  const [loadError, setLoadError] = useState(null);
   
   // Media refs
   const audioRef = useRef(null);
@@ -17,35 +18,49 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
   const rafRef = useRef(null);
   
   // Player state
-  const activePlayerRef = useRef('A'); // 'A' or 'B'
+  const activePlayerRef = useRef('A');
   const preloadedClipIndexRef = useRef(-1);
   
   const isReady = projectStatus?.has_edit_plan;
 
   // ============================================================================
-  // STEP 1: Parse XML data on mount
+  // STEP 1: Parse data on mount
   // ============================================================================
   useEffect(() => {
     if (!isReady) return;
     
-    const loadXMLData = async () => {
+    const loadData = async () => {
       try {
-        // Fetch XML files
+        setLoadError(null);
+        
+        console.log('🔄 Loading edit plan and scene index...');
+        
+        // Fetch JSON data
         const [editResponse, indexResponse] = await Promise.all([
-          fetch(`http://127.0.0.1:5000/projects/${projectName}/edit-plan-xml`),
-          fetch(`http://127.0.0.1:5000/projects/${projectName}/scene-index-xml`)
+          fetch(`http://127.0.0.1:5000/projects/${projectName}/edit-plan`),
+          fetch(`http://127.0.0.1:5000/projects/${projectName}/scene-index`)
         ]);
         
-        // For now, we'll use JSON endpoints since XML endpoints don't exist yet
-        // TODO: Backend should expose XML endpoints or we parse from JSON
+        if (!editResponse.ok || !indexResponse.ok) {
+          throw new Error('Failed to fetch project data');
+        }
+        
         const [editData, indexData] = await Promise.all([
-          fetch(`http://127.0.0.1:5000/projects/${projectName}/edit-plan`).then(r => r.json()),
-          fetch(`http://127.0.0.1:5000/projects/${projectName}/scene-index`).then(r => r.json())
+          editResponse.json(),
+          indexResponse.json()
         ]);
         
-        if (editData.success && indexData.success) {
-          // Parse clips from edit plan
-          const parsedClips = editData.plan.map((clip, index) => ({
+        console.log('📊 Edit plan:', editData);
+        console.log('📊 Scene index:', indexData);
+        
+        if (!editData.success || !indexData.success) {
+          throw new Error('Invalid response from server');
+        }
+        
+        // Parse clips from edit plan
+        const parsedClips = editData.plan
+          .filter(clip => clip.scene_id !== null) // Skip clips without scenes
+          .map((clip, index) => ({
             index,
             start: clip.start,
             end: clip.end,
@@ -53,32 +68,52 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
             phrase: clip.phrase,
             sceneId: clip.scene_id
           }));
-          
-          // Create scene map: sceneId -> { videoIndex, startTime, videoUrl }
-          const parsedSceneMap = {};
-          indexData.scenes.forEach(scene => {
-            parsedSceneMap[scene.id] = {
-              videoIndex: scene.video_index || 0,
-              startTime: scene.start_time,
-              videoUrl: `http://127.0.0.1:5000/projects/${projectName}/video/${scene.video_index || 0}`
-            };
-          });
-          
-          setClips(parsedClips);
-          setSceneMap(parsedSceneMap);
-          
-          console.log(`✅ Loaded ${parsedClips.length} clips and ${Object.keys(parsedSceneMap).length} scenes`);
+        
+        if (parsedClips.length === 0) {
+          throw new Error('No valid clips found in edit plan');
         }
+        
+        // Create scene map: sceneId -> { videoIndex, startTime, endTime, videoUrl }
+        const parsedSceneMap = {};
+        
+        indexData.scenes.forEach(scene => {
+          const videoIndex = scene.video_index ?? 0;
+          
+          parsedSceneMap[scene.id] = {
+            videoIndex: videoIndex,
+            startTime: scene.start_time,
+            endTime: scene.end_time,
+            duration: scene.duration,
+            // ✅ FIX: Правильный формат URL для эндпоинта
+            videoUrl: `http://127.0.0.1:5000/projects/${encodeURIComponent(projectName)}/video/${videoIndex}`
+          };
+        });
+        
+        console.log('✅ Parsed clips:', parsedClips.length);
+        console.log('✅ Parsed scenes:', Object.keys(parsedSceneMap).length);
+        console.log('📹 Sample scene:', parsedSceneMap[parsedClips[0]?.sceneId]);
+        
+        setClips(parsedClips);
+        setSceneMap(parsedSceneMap);
+        
+        // Preload first clip
+        if (parsedClips.length > 0) {
+          setTimeout(() => {
+            preloadClip(0);
+          }, 500);
+        }
+        
       } catch (err) {
-        console.error('Failed to load XML data:', err);
+        console.error('❌ Failed to load data:', err);
+        setLoadError(err.message);
       }
     };
     
-    loadXMLData();
+    loadData();
   }, [isReady, projectName]);
 
   // ============================================================================
-  // STEP 2: Double Buffer Preloading System
+  // STEP 2: Double Buffer Preloading
   // ============================================================================
   
   const getActivePlayer = () => {
@@ -94,87 +129,130 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
   };
   
   /**
-   * Preload the next clip into the inactive player
+   * Preload a specific clip into a player
    */
-  const preloadNextClip = (nextClipIndex) => {
-    if (nextClipIndex >= clips.length || nextClipIndex < 0) return;
-    if (preloadedClipIndexRef.current === nextClipIndex) return; // Already preloaded
+  const preloadClip = (clipIndex, targetPlayer = null) => {
+    if (clipIndex < 0 || clipIndex >= clips.length) {
+      console.warn(`⚠️ Invalid clip index: ${clipIndex}`);
+      return;
+    }
     
-    const nextClip = clips[nextClipIndex];
-    const scene = sceneMap[nextClip.sceneId];
+    const clip = clips[clipIndex];
+    const scene = sceneMap[clip.sceneId];
     
-    if (!scene) return;
+    if (!scene) {
+      console.error(`❌ Scene not found for clip ${clipIndex}, sceneId: ${clip.sceneId}`);
+      return;
+    }
     
-    const inactivePlayer = getInactivePlayer();
-    if (!inactivePlayer) return;
+    const player = targetPlayer || getInactivePlayer();
     
-    // Calculate video timecode for this clip
-    const clipOffset = 0; // Clip always starts at its beginning for preload
-    const videoTime = scene.startTime + clipOffset;
+    if (!player) {
+      console.error('❌ No player available for preload');
+      return;
+    }
     
-    // Set source and seek
-    inactivePlayer.src = scene.videoUrl;
-    inactivePlayer.currentTime = videoTime;
-    inactivePlayer.load();
+    // Set video source
+    const videoUrl = scene.videoUrl;
     
-    preloadedClipIndexRef.current = nextClipIndex;
+    console.log(`🔄 Preloading clip ${clipIndex} into Player ${targetPlayer ? 'specified' : (activePlayerRef.current === 'A' ? 'B' : 'A')}`);
+    console.log(`   Scene ${scene.videoIndex}, start: ${scene.startTime}s, URL: ${videoUrl}`);
     
-    console.log(`🔄 Preloaded clip ${nextClipIndex} into Player ${activePlayerRef.current === 'A' ? 'B' : 'A'}`);
+    // ✅ FIX: Set source and initial time
+    if (player.src !== videoUrl) {
+      player.src = videoUrl;
+    }
+    
+    // Seek to scene start
+    player.currentTime = scene.startTime;
+    
+    // Ensure loaded
+    player.load();
+    
+    // Mark as preloaded
+    if (!targetPlayer) {
+      preloadedClipIndexRef.current = clipIndex;
+    }
+    
+    // Add error handler
+    player.onerror = (e) => {
+      console.error(`❌ Video load error for clip ${clipIndex}:`, e);
+      console.error('   URL:', videoUrl);
+      console.error('   Error code:', player.error?.code);
+      console.error('   Error message:', player.error?.message);
+    };
+    
+    // Success handler
+    player.onloadedmetadata = () => {
+      console.log(`✅ Video metadata loaded for clip ${clipIndex}`);
+      console.log(`   Duration: ${player.duration}s, seekable: ${player.seekable.length > 0}`);
+    };
   };
   
   /**
    * Switch to a specific clip (gapless transition)
    */
   const switchToClip = (clipIndex) => {
-    if (clipIndex >= clips.length || clipIndex < 0) return;
+    if (clipIndex < 0 || clipIndex >= clips.length) return;
     
     const clip = clips[clipIndex];
     const scene = sceneMap[clip.sceneId];
     
-    if (!scene) return;
+    if (!scene) {
+      console.error(`❌ Scene not found for clip ${clipIndex}`);
+      return;
+    }
+    
+    console.log(`✂️ Switching to clip ${clipIndex} (scene ${clip.sceneId})`);
     
     const activePlayer = getActivePlayer();
-    const inactivePlayer = getInactivePlayer();
     
-    // If next clip is already preloaded in inactive player, just switch
+    // If next clip is preloaded in inactive player, switch
     if (preloadedClipIndexRef.current === clipIndex) {
-      // Pause current player
+      // Pause current
       if (activePlayer) activePlayer.pause();
       
       // Switch active player
       switchPlayers();
       
-      // Play new active player
+      // Play new active
       const newActivePlayer = getActivePlayer();
       if (newActivePlayer && isPlaying) {
-        newActivePlayer.play().catch(() => {});
+        newActivePlayer.play().catch(err => {
+          console.error('❌ Play error:', err);
+        });
       }
       
-      console.log(`✂️ Switched to clip ${clipIndex} (Player ${activePlayerRef.current})`);
+      console.log(`✅ Switched to preloaded clip (Player ${activePlayerRef.current})`);
     } else {
-      // Fallback: load directly into active player (will cause brief black frame)
-      const clipOffset = currentTime - clip.start;
-      const videoTime = scene.startTime + clipOffset;
+      // Fallback: load directly
+      console.warn(`⚠️ Clip ${clipIndex} not preloaded, loading directly`);
       
       if (activePlayer) {
+        const clipOffset = Math.max(0, currentTime - clip.start);
+        const videoTime = scene.startTime + clipOffset;
+        
         activePlayer.src = scene.videoUrl;
         activePlayer.currentTime = videoTime;
+        
         if (isPlaying) {
-          activePlayer.play().catch(() => {});
+          activePlayer.play().catch(err => {
+            console.error('❌ Play error:', err);
+          });
         }
       }
-      
-      console.warn(`⚠️ Clip ${clipIndex} not preloaded, loading directly`);
     }
     
     setCurrentClipIndex(clipIndex);
     
     // Preload NEXT clip
-    preloadNextClip(clipIndex + 1);
+    if (clipIndex + 1 < clips.length) {
+      preloadClip(clipIndex + 1);
+    }
   };
 
   // ============================================================================
-  // STEP 3: Main Playback Engine (RAF loop)
+  // STEP 3: Main Playback Engine
   // ============================================================================
   useEffect(() => {
     if (!isPlaying || clips.length === 0 || !audioRef.current) {
@@ -188,7 +266,7 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       const delta = (now - lastUpdate) / 1000;
       lastUpdate = now;
 
-      // Get timeline position from audio (master clock)
+      // Get timeline position from audio
       const timelineTime = audioRef.current.currentTime;
       setCurrentTime(timelineTime);
 
@@ -209,12 +287,12 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
         return;
       }
 
-      // Check if we need to switch clips
+      // Switch clips if needed
       if (clipIndex !== currentClipIndex) {
         switchToClip(clipIndex);
       }
 
-      // Sync active player to timeline
+      // Sync active player
       const activePlayer = getActivePlayer();
       if (activePlayer && clips[clipIndex]) {
         const clip = clips[clipIndex];
@@ -228,7 +306,6 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
           // Correct drift > 0.1s
           if (drift > 0.1) {
             activePlayer.currentTime = targetVideoTime;
-            console.log(`🔧 Corrected drift: ${drift.toFixed(3)}s`);
           }
         }
       }
@@ -251,6 +328,12 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
     
     if (!isPlaying) {
       try {
+        // Preload first clip if not already
+        if (currentClipIndex === 0 && preloadedClipIndexRef.current !== 0) {
+          preloadClip(0, getActivePlayer());
+          await new Promise(resolve => setTimeout(resolve, 500)); // Wait for load
+        }
+        
         // Start playback
         await audioRef.current.play();
         
@@ -259,12 +342,15 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
           await activePlayer.play();
         }
         
-        // Preload next clip
-        preloadNextClip(currentClipIndex + 1);
+        // Preload next
+        if (currentClipIndex + 1 < clips.length) {
+          preloadClip(currentClipIndex + 1);
+        }
         
         setIsPlaying(true);
       } catch (err) {
-        console.error('Play error:', err);
+        console.error('❌ Play error:', err);
+        setLoadError(`Playback error: ${err.message}`);
       }
     } else {
       // Pause
@@ -330,8 +416,12 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       {/* Hidden audio track */}
       <audio 
         ref={audioRef}
-        src={`http://127.0.0.1:5000/projects/${projectName}/voice.mp3`}
+        src={`http://127.0.0.1:5000/projects/${encodeURIComponent(projectName)}/voice.mp3`}
         preload="auto"
+        onError={(e) => {
+          console.error('❌ Audio load error:', e);
+          setLoadError('Failed to load audio');
+        }}
       />
       
       <div className="flex items-center justify-between mb-4">
@@ -346,6 +436,13 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
         )}
       </div>
 
+      {/* Error Display */}
+      {loadError && (
+        <div className="mb-4 p-3 bg-red-900/20 border border-red-800 rounded text-red-400 text-sm">
+          ⚠️ {loadError}
+        </div>
+      )}
+
       {/* Video Player Container */}
       <div className="aspect-video bg-gray-900 rounded-lg mb-4 flex items-center justify-center relative overflow-hidden">
         {!isReady ? (
@@ -355,7 +452,7 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
           </div>
         ) : showPlayer ? (
           <div className="relative w-full h-full bg-black">
-            {/* Double Buffer: Player A */}
+            {/* Player A */}
             <video
               ref={playerARef}
               className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
@@ -364,7 +461,7 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               preload="auto"
             />
             
-            {/* Double Buffer: Player B */}
+            {/* Player B */}
             <video
               ref={playerBRef}
               className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
@@ -382,19 +479,17 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               </div>
             )}
 
-            {/* Play button overlay */}
-            <div className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition bg-black bg-opacity-30 z-20">
-              <button 
-                onClick={togglePlay}
-                className="p-4 bg-blue-600 hover:bg-blue-700 rounded-full transition"
-              >
-                {isPlaying ? (
-                  <PauseCircle className="w-12 h-12 text-white" />
-                ) : (
+            {/* Play overlay */}
+            {!isPlaying && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-30 z-20">
+                <button 
+                  onClick={togglePlay}
+                  className="p-4 bg-blue-600 hover:bg-blue-700 rounded-full transition"
+                >
                   <PlayCircle className="w-12 h-12 text-white" />
-                )}
-              </button>
-            </div>
+                </button>
+              </div>
+            )}
 
             {/* Debug info */}
             <div className="absolute top-2 right-2 bg-black bg-opacity-70 px-3 py-2 rounded text-xs text-white font-mono z-10">
@@ -402,6 +497,9 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               <div>Scene: {currentClip?.sceneId ?? 'N/A'}</div>
               <div>Player: {activePlayerRef.current}</div>
               <div>Time: {formatTime(currentTime)}</div>
+              {currentClip && sceneMap[currentClip.sceneId] && (
+                <div>Video: {sceneMap[currentClip.sceneId].videoIndex}</div>
+              )}
             </div>
           </div>
         ) : (
@@ -411,24 +509,6 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               className="w-20 h-20 text-blue-500 mx-auto mb-4 cursor-pointer hover:text-blue-400 transition" 
             />
             <p className="text-gray-400 text-sm">Click to open player</p>
-          </div>
-        )}
-
-        {/* Processing progress overlay */}
-        {!isReady && progress > 0 && (
-          <div className="absolute inset-0 bg-gradient-to-t from-gray-900 via-transparent to-transparent flex items-end justify-center p-6">
-            <div className="w-full">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-sm text-gray-400">Processing</span>
-                <span className="text-sm font-semibold text-white">{progress}%</span>
-              </div>
-              <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-blue-500 transition-all duration-500"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-            </div>
           </div>
         )}
       </div>
@@ -445,19 +525,15 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               className="h-full bg-blue-500 rounded-full transition group-hover:bg-blue-400"
               style={{ width: `${progressPercent}%` }}
             />
-            <div 
-              className="absolute top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full shadow-lg opacity-0 group-hover:opacity-100 transition"
-              style={{ left: `${progressPercent}%`, transform: 'translate(-50%, -50%)' }}
-            />
           </div>
 
-          {/* Time display */}
+          {/* Time */}
           <div className="flex items-center justify-between text-sm text-gray-400">
             <span>{formatTime(currentTime)}</span>
             <span>{formatTime(totalDuration)}</span>
           </div>
 
-          {/* Control buttons */}
+          {/* Controls */}
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <button onClick={skipBackward} className="p-2 hover:bg-gray-700 rounded transition">
@@ -476,7 +552,6 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               </button>
             </div>
 
-            {/* Volume control */}
             <button onClick={toggleMute} className="p-2 hover:bg-gray-700 rounded transition">
               {muted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
             </button>
@@ -487,42 +562,14 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       {/* Project Status */}
       <div className="space-y-3 text-sm mt-4">
         <div className="flex items-center justify-between">
-          <span className="text-gray-400">Project:</span>
-          <span className="text-white font-medium">{projectName}</span>
+          <span className="text-gray-400">Clips loaded:</span>
+          <span className="text-white font-medium">{clips.length}</span>
         </div>
         
         <div className="flex items-center justify-between">
-          <span className="text-gray-400">Status:</span>
-          <span className={`font-medium ${isReady ? 'text-green-400' : 'text-yellow-400'}`}>
-            {isReady ? 'Ready' : 'Processing...'}
-          </span>
+          <span className="text-gray-400">Scenes mapped:</span>
+          <span className="text-white font-medium">{Object.keys(sceneMap).length}</span>
         </div>
-
-        {projectStatus && isReady && (
-          <div className="pt-3 border-t border-gray-700">
-            <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">Pipeline</div>
-            <div className="space-y-2">
-              <StatusItem label="Transcript" completed={projectStatus.has_transcript} />
-              <StatusItem label="Video Indexed" completed={projectStatus.has_frames} />
-              <StatusItem label="Scenes Analyzed" completed={projectStatus.has_characters} />
-              <StatusItem label="Edit Plan" completed={projectStatus.has_edit_plan} />
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function StatusItem({ label, completed }) {
-  return (
-    <div className="flex items-center justify-between">
-      <span className="text-gray-400 text-xs">{label}</span>
-      <div className="flex items-center gap-2">
-        <div className={`w-2 h-2 rounded-full ${completed ? 'bg-green-500' : 'bg-gray-600'}`} />
-        <span className={`text-xs ${completed ? 'text-green-400' : 'text-gray-500'}`}>
-          {completed ? 'Done' : 'Pending'}
-        </span>
       </div>
     </div>
   );
