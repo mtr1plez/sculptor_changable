@@ -1,27 +1,30 @@
 # -*- coding: utf-8 -*-
-# src/video_indexer.py
+# src/video_indexer.py - Multi-video support
 import os
 import cv2
 import json
-import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 from sentence_transformers import SentenceTransformer
+from pathlib import Path
 
 from utils import load_config
 
-def detect_scenes(video_path, threshold=27.0, min_duration=1.0, start_offset=0.2):
+def detect_scenes(video_path, threshold=27.0, min_duration=1.0, start_offset=0.2, video_index=0):
     """
-    Шаг 1: Нарезка видео на сцены
+    Detect scenes in a video file
     
     Args:
-        start_offset: Смещение начала сцены в секундах (по умолчанию 0.2)
-                     Компенсирует раннее срабатывание детектора
+        video_path: Path to video
+        threshold: Scene detection threshold
+        min_duration: Minimum scene duration
+        start_offset: Timing offset compensation
+        video_index: Index of this video in the project
     """
-    print(f"✂️ Ищем сцены в {os.path.basename(video_path)}...")
+    print(f"✂️ Detecting scenes in video {video_index}: {os.path.basename(video_path)}")
     
     video_manager = VideoManager([video_path])
     scene_manager = SceneManager()
@@ -35,24 +38,19 @@ def detect_scenes(video_path, threshold=27.0, min_duration=1.0, start_offset=0.2
     scene_id = 0
     
     for start, end in scene_list:
-        # КРИТИЧНО: Применяем offset к start_time
         start_time = start.get_seconds() + start_offset
         end_time = end.get_seconds()
-        
-        # Проверяем, что после offset сцена не стала слишком короткой
         duration = end_time - start_time
         
         if duration < min_duration:
-            print(f"⚠️ Пропускаем сцену {scene_id}: слишком короткая после offset ({duration:.2f}s)")
             continue
         
-        # Также проверяем, что start не вышел за end
         if start_time >= end_time:
-            print(f"⚠️ Пропускаем сцену {scene_id}: start >= end после offset")
             continue
             
         scenes.append({
             "id": scene_id,
+            "video_index": video_index,  # NEW: which video this scene is from
             "start_time": start_time,
             "end_time": end_time,
             "duration": duration,
@@ -60,74 +58,78 @@ def detect_scenes(video_path, threshold=27.0, min_duration=1.0, start_offset=0.2
         })
         scene_id += 1
     
-    print(f"✅ Найдено {len(scenes)} сцен (с offset +{start_offset}s).")
+    print(f"✅ Found {len(scenes)} scenes in video {video_index}")
     return scenes
 
-def extract_frames(video_path, scenes, output_dir, image_size=224):
-    """Шаг 2: Извлечение кадров для каждой сцены"""
-    print("📸 Извлекаем кадры...")
+def extract_frames(video_path, scenes, output_dir, image_size=224, video_index=0):
+    """
+    Extract keyframes from scenes
+    
+    Args:
+        video_path: Path to video
+        scenes: List of scene dicts
+        output_dir: Output directory for frames
+        image_size: Target image size
+        video_index: Video index (for frame naming)
+    """
+    print(f"📸 Extracting frames from video {video_index}...")
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
-        raise IOError(f"Не удалось открыть видео: {video_path}")
+        raise IOError(f"Cannot open video: {video_path}")
 
     valid_scenes = []
 
-    for scene in tqdm(scenes):
-        # Берем кадр из середины сцены
+    for scene in tqdm(scenes, desc=f"Video {video_index}"):
+        # Get middle frame
         mid_time = scene["start_time"] + (scene["duration"] / 2)
-        
-        # НОВОЕ: Сохраняем время ключевого кадра для точной синхронизации в XML
         scene["key_frame_time"] = mid_time
         
-        # Перематываем видео на нужный момент (в миллисекундах)
+        # Seek to frame
         cap.set(cv2.CAP_PROP_POS_MSEC, mid_time * 1000)
         ret, frame = cap.read()
         
         if ret:
-            # Конвертируем BGR (OpenCV) -> RGB (PIL)
+            # Convert BGR -> RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
-            
-            # Ресайз для экономии места и скорости
             img = img.resize((image_size, image_size))
             
-            filename = f"scene_{scene['id']}.jpg"
+            # Naming: video_0_scene_42.jpg
+            filename = f"video_{video_index}_scene_{scene['id']}.jpg"
             filepath = os.path.join(output_dir, filename)
-            relative_path = os.path.relpath(filepath)
             img.save(filepath, quality=80)
             
-            scene["frame_path"] = relative_path
+            scene["frame_path"] = os.path.relpath(filepath)
             valid_scenes.append(scene)
         else:
-            print(f"⚠️ Не удалось прочитать кадр для сцены {scene['id']}")
+            print(f"⚠️ Cannot read frame for scene {scene['id']}")
 
     cap.release()
     return valid_scenes
 
 def embed_scenes(scenes, model_name, device):
-    """Шаг 3: Создание векторов через CLIP"""
-    print(f"🧠 Загружаем CLIP ({model_name}) на {device}...")
+    """Generate CLIP embeddings for all scenes"""
+    print(f"🧠 Loading CLIP ({model_name}) on {device}...")
     model = SentenceTransformer(model_name, device=device)
     
     image_paths = [s["frame_path"] for s in scenes]
     
-    print("⚡ Генерируем эмбеддинги (векторы)...")
+    print("⚡ Generating embeddings...")
     
-    # ИСПРАВЛЕНО: Открываем изображения батчами, чтобы не держать все файлы открытыми
     batch_size = 32
     all_embeddings = []
     
     for i in tqdm(range(0, len(image_paths), batch_size), desc="Encoding batches"):
         batch_paths = image_paths[i:i + batch_size]
         
-        # Открываем изображения для батча
+        # Open images for batch
         images = []
         for path in batch_paths:
             img = Image.open(path)
             images.append(img)
         
-        # Кодируем батч
+        # Encode batch
         batch_embeddings = model.encode(
             images,
             batch_size=batch_size,
@@ -137,77 +139,113 @@ def embed_scenes(scenes, model_name, device):
         
         all_embeddings.append(batch_embeddings)
         
-        # Закрываем изображения
+        # Close images
         for img in images:
             img.close()
     
-    # Объединяем все батчи
+    # Combine all batches
     embeddings = np.vstack(all_embeddings)
     
     return embeddings
 
 def run_indexer():
+    """
+    Main indexer - processes ALL videos in project
+    """
     cfg = load_config()
     
-    video_path = cfg["paths"]["input_video"]
+    # Get project manifest
+    from project_manager import ProjectManager
+    pm = ProjectManager()
+    project_name = cfg.get('current_project')
     
-    if not os.path.exists(video_path):
-        base, _ = os.path.splitext(video_path)
-        mp4_path = base + ".mp4"
-        mkv_path = base + ".mkv"
-
-        if os.path.exists(mp4_path):
-            video_path = mp4_path
-        elif os.path.exists(mkv_path):
-            video_path = mkv_path
-        else:
-            raise FileNotFoundError(f"Не найдено видео ни {mp4_path}, ни {mkv_path}")
-        
+    if not project_name:
+        raise ValueError("No active project in config.yaml")
+    
+    manifest = pm.get_project_manifest(project_name)
+    videos = manifest.get('videos', [])
+    
+    if not videos:
+        raise ValueError(f"No videos found in project {project_name}")
+    
+    print(f"🎬 SculptorPro - Multi-Video Indexer")
+    print(f"   Project: {project_name}")
+    print(f"   Videos: {len(videos)}")
+    print("=" * 60)
+    
     cache_dir = cfg["paths"]["cache_dir"]
     frames_dir = cfg["paths"]["frames_dir"]
     index_path = os.path.join(cache_dir, "scene_index.json")
     emb_path = os.path.join(cache_dir, "embeddings.npy")
 
-    # 0. Проверка: Если индекс уже есть, не делаем работу дважды
+    # Check if already exists
     if os.path.exists(index_path) and os.path.exists(emb_path):
-        print("📂 Индекс уже существует. Пропускаем индексацию.")
-        # Тут можно добавить логику "force update", если надо
+        print("📂 Index already exists. Skipping indexing.")
         return
 
-    # 1. Детекция
-    scenes = detect_scenes(
-        video_path, 
-        threshold=cfg["params"]["scene_threshold"],
-        min_duration=cfg["params"]["min_scene_duration"]
-    )
+    all_scenes = []
+    global_scene_id = 0  # Global scene ID across all videos
     
-    # 2. Экстракция кадров
-    scenes = extract_frames(
-        video_path, 
-        scenes, 
-        frames_dir, 
-        image_size=cfg["params"]["image_size"]
-    )
+    # Process each video
+    for video_info in videos:
+        video_index = video_info['index']
+        video_filename = video_info['filename']
+        video_path = os.path.join(cfg["paths"]["videos_dir"], video_filename)
+        
+        if not os.path.exists(video_path):
+            print(f"⚠️ Video not found: {video_path}")
+            continue
+        
+        print(f"\n📹 Processing video {video_index + 1}/{len(videos)}")
+        print(f"   File: {video_filename}")
+        
+        # 1. Detect scenes
+        scenes = detect_scenes(
+            video_path,
+            threshold=cfg["params"]["scene_threshold"],
+            min_duration=cfg["params"]["min_scene_duration"],
+            video_index=video_index
+        )
+        
+        # 2. Extract frames
+        scenes = extract_frames(
+            video_path,
+            scenes,
+            frames_dir,
+            image_size=cfg["params"]["image_size"],
+            video_index=video_index
+        )
+        
+        # 3. Assign global scene IDs
+        for scene in scenes:
+            scene['global_id'] = global_scene_id
+            scene['original_id'] = scene['id']  # Keep local ID
+            scene['id'] = global_scene_id  # Use global ID
+            global_scene_id += 1
+        
+        all_scenes.extend(scenes)
     
-    # 3. Эмбеддинг
+    print(f"\n✅ Total scenes across all videos: {len(all_scenes)}")
+    
+    # 4. Generate embeddings for ALL scenes
     embeddings = embed_scenes(
-        scenes, 
-        cfg["models"]["clip_model"], 
+        all_scenes,
+        cfg["models"]["clip_model"],
         cfg["models"]["device"]
     )
     
-    # 4. Сохранение результатов
-    print("💾 Сохраняем данные...")
+    # 5. Save results
+    print("💾 Saving index and embeddings...")
     
-    # Сохраняем JSON (метаданные)
     with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(scenes, f, indent=4)
+        json.dump(all_scenes, f, indent=4)
         
-    # Сохраняем NPY (векторы)
     np.save(emb_path, embeddings)
     
-    print("🎉 Индексация завершена!")
+    print("🎉 Multi-video indexing complete!")
+    print(f"   Total videos: {len(videos)}")
+    print(f"   Total scenes: {len(all_scenes)}")
+    print(f"   Embeddings shape: {embeddings.shape}")
 
 if __name__ == "__main__":
-    # Для теста запускаем функцию напрямую
     run_indexer()
