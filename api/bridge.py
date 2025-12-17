@@ -71,82 +71,110 @@ def get_projects():
             'error': str(e)
         }), 500
 
-@app.route('/projects', methods=['POST'])
-def create_project():
-    """Create a new project (Electron mode - file paths)"""
-    try:
-        data = request.json
-        project_name = data.get('name')
-        movie_path = data.get('moviePath')
-        voice_path = data.get('voicePath')
-        
-        if not all([project_name, movie_path, voice_path]):
-            return jsonify({
-                'success': False,
-                'error': 'Missing required fields'
-            }), 400
-        
-        # Create project directory structure
-        project_path = project_manager.create_project(project_name)
-        
-        # Copy files to input directory
-        import shutil
-        input_dir = project_path / 'input'
-        
-        shutil.copy(movie_path, input_dir / 'movie.mp4')
-        shutil.copy(voice_path, input_dir / 'voice.mp3')
-        
-        # Update config
-        project_manager.update_config(project_name)
-        
-        return jsonify({
-            'success': True,
-            'project': {
-                'name': project_name,
-                'path': str(project_path)
-            }
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
 @app.route('/projects/upload', methods=['POST'])
 def create_project_upload():
-    """Create project with file upload (Browser mode)"""
+    """
+    Create project with file upload (Browser mode) - MULTI-VIDEO SUPPORT
+    Expects:
+    - name: project name
+    - videos[]: array of video files
+    - voice: audio file
+    """
     try:
         from werkzeug.utils import secure_filename
         
         project_name = request.form.get('name')
-        movie_file = request.files.get('movie')
+        video_files = request.files.getlist('videos[]')  # Multiple videos
         voice_file = request.files.get('voice')
         
-        if not all([project_name, movie_file, voice_file]):
+        if not project_name:
             return jsonify({
                 'success': False,
-                'error': 'Missing required fields'
+                'error': 'Project name is required'
+            }), 400
+        
+        if not video_files or len(video_files) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'At least one video file is required'
+            }), 400
+        
+        if not voice_file:
+            return jsonify({
+                'success': False,
+                'error': 'Voice file is required'
             }), 400
         
         # Create project directory structure
         project_path = project_manager.create_project(project_name)
-        input_dir = project_path / 'input'
         
-        # Save uploaded files
-        movie_file.save(input_dir / 'movie.mp4')
-        voice_file.save(input_dir / 'voice.mp3')
+        # Directories
+        videos_dir = project_path / 'input' / 'videos'
+        audio_dir = project_path / 'input' / 'audio'
         
-        # Update config
+        videos_dir.mkdir(parents=True, exist_ok=True)
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save all video files with index naming
+        print(f"📹 Saving {len(video_files)} videos...")
+        for index, video_file in enumerate(video_files):
+            # Get file extension
+            original_name = secure_filename(video_file.filename)
+            extension = Path(original_name).suffix
+            
+            # Save as video_000.mp4, video_001.mp4, etc.
+            video_filename = f"video_{index:03d}{extension}"
+            video_path = videos_dir / video_filename
+            
+            video_file.save(str(video_path))
+            print(f"   ✅ Saved: {video_filename} ({video_file.content_length / (1024*1024):.1f} MB)")
+        
+        # Save voice file
+        voice_filename = "voice.mp3"
+        voice_path = audio_dir / voice_filename
+        voice_file.save(str(voice_path))
+        print(f"   ✅ Saved: {voice_filename}")
+        
+        # Create/Update manifest with video info
+        manifest_path = project_path / 'project.json'
+        
+        manifest = {
+            'name': project_name,
+            'created_at': str(project_path),
+            'videos': [],
+            'audio_file': voice_filename
+        }
+        
+        for index, video_file in enumerate(video_files):
+            original_name = secure_filename(video_file.filename)
+            extension = Path(original_name).suffix
+            video_filename = f"video_{index:03d}{extension}"
+            
+            manifest['videos'].append({
+                'index': index,
+                'filename': video_filename,
+                'original_name': original_name
+            })
+        
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        
+        # Update config to use this project
         project_manager.update_config(project_name)
+        
+        print(f"✅ Project created: {project_name} ({len(video_files)} videos)")
         
         return jsonify({
             'success': True,
             'project': {
                 'name': project_name,
-                'path': str(project_path)
+                'path': str(project_path),
+                'video_count': len(video_files)
             }
         })
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e)
@@ -183,6 +211,81 @@ def get_project_status(project_name):
             'success': False,
             'error': str(e)
         }), 500
+
+@app.route('/projects/<project_name>/videos', methods=['GET'])
+def get_project_videos(project_name):
+    """Get list of videos in project"""
+    try:
+        manifest = project_manager.get_project_manifest(project_name)
+        videos = manifest.get('videos', [])
+        
+        return jsonify({
+            'success': True,
+            'videos': videos
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/projects/<project_name>/video/<int:video_index>', methods=['GET'])
+def get_project_video(project_name, video_index):
+    """
+    Stream a specific video file with HTTP Range support
+    video_index: 0, 1, 2, etc.
+    """
+    try:
+        project_path = project_manager.projects_root / project_name
+        manifest = project_manager.get_project_manifest(project_name)
+        
+        videos = manifest.get('videos', [])
+        video_info = next((v for v in videos if v['index'] == video_index), None)
+        
+        if not video_info:
+            return f"Video {video_index} not found", 404
+        
+        video_path = project_path / 'input' / 'videos' / video_info['filename']
+        
+        if not video_path.exists():
+            return f"Video file not found: {video_info['filename']}", 404
+        
+        # Support for HTTP Range requests (critical for video streaming)
+        range_header = request.headers.get('Range', None)
+        
+        if not range_header:
+            return send_file(str(video_path), mimetype='video/mp4')
+        
+        # Handle Range request for streaming
+        size = os.path.getsize(video_path)
+        byte1, byte2 = 0, None
+        
+        m = re.search(r'(\d+)-(\d*)', range_header)
+        g = m.groups()
+        
+        if g[0]:
+            byte1 = int(g[0])
+        if g[1]:
+            byte2 = int(g[1])
+        
+        length = size - byte1
+        if byte2 is not None:
+            length = byte2 + 1 - byte1
+        
+        data = None
+        with open(video_path, 'rb') as f:
+            f.seek(byte1)
+            data = f.read(length)
+        
+        rv = Response(data, 206, mimetype='video/mp4', direct_passthrough=True)
+        rv.headers.add('Content-Range', f'bytes {byte1}-{byte1 + length - 1}/{size}')
+        rv.headers.add('Accept-Ranges', 'bytes')
+        return rv
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return str(e), 500
 
 # ============================================================================
 # PIPELINE STEP EXECUTION - Individual steps run by UI
@@ -263,10 +366,10 @@ def run_audio_step(movie_title=None):
     return "Audio processing complete"
 
 def run_video_step(movie_title=None):
-    """Video Indexing + Scene Detection"""
+    """Video Indexing + Scene Detection (MULTI-VIDEO)"""
     from video_indexer import run_indexer
     
-    print("🎬 Step 2/4: Video Indexing")
+    print("🎬 Step 2/4: Video Indexing (Multi-video support)")
     run_indexer()
     
     return "Video indexing complete"
@@ -387,7 +490,13 @@ def get_voice(project_name):
     """Get voice audio file"""
     try:
         project_path = project_manager.projects_root / project_name
-        voice_path = project_path / 'input' / 'voice.mp3'
+        
+        # Try new location first (audio/voice.mp3)
+        voice_path = project_path / 'input' / 'audio' / 'voice.mp3'
+        
+        # Fallback to old location (input/voice.mp3)
+        if not voice_path.exists():
+            voice_path = project_path / 'input' / 'voice.mp3'
         
         if not voice_path.exists():
             return "Voice file not found", 404
@@ -395,53 +504,6 @@ def get_voice(project_name):
         return send_file(str(voice_path), mimetype='audio/mpeg')
         
     except Exception as e:
-        return str(e), 500
-    
-@app.route('/projects/<project_name>/movie.mp4', methods=['GET'])
-def get_movie(project_name):
-    """Get movie video file with HTTP Range support (streaming)"""
-    try:
-        project_path = project_manager.projects_root / project_name
-        movie_path = project_path / 'input' / 'movie.mp4'
-        
-        if not movie_path.exists():
-            return "Movie file not found", 404
-        
-        # Support for HTTP Range requests (critical for video!)
-        range_header = request.headers.get('Range', None)
-        
-        if not range_header:
-            return send_file(str(movie_path), mimetype='video/mp4')
-        
-        # Handle Range request for streaming
-        size = os.path.getsize(movie_path)
-        byte1, byte2 = 0, None
-        
-        m = re.search(r'(\d+)-(\d*)', range_header)
-        g = m.groups()
-        
-        if g[0]:
-            byte1 = int(g[0])
-        if g[1]:
-            byte2 = int(g[1])
-        
-        length = size - byte1
-        if byte2 is not None:
-            length = byte2 + 1 - byte1
-        
-        data = None
-        with open(movie_path, 'rb') as f:
-            f.seek(byte1)
-            data = f.read(length)
-        
-        rv = Response(data, 206, mimetype='video/mp4', direct_passthrough=True)
-        rv.headers.add('Content-Range', f'bytes {byte1}-{byte1 + length - 1}/{size}')
-        rv.headers.add('Accept-Ranges', 'bytes')
-        return rv
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
         return str(e), 500
 
 @app.route('/projects/<project_name>/scene-index', methods=['GET'])
@@ -471,7 +533,7 @@ def get_scene_index(project_name):
         }), 500
 
 if __name__ == '__main__':
-    print('🚀 Sculptor Pro API v2.0')
+    print('🚀 Sculptor Pro API v2.0 (Multi-video support)')
     print('📍 URL: http://localhost:5000')
     print('📍 Health: http://localhost:5000/health')
     print('💡 Pipeline is now orchestrated by UI, not backend')
