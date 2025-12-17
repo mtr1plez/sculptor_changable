@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Eye, PlayCircle, PauseCircle, AlertCircle, Maximize2, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-react';
+import { Eye, PlayCircle, PauseCircle, Maximize2, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-react';
 
 export default function VideoPreview({ projectName, projectStatus, progress }) {
   const [showPlayer, setShowPlayer] = useState(false);
@@ -7,30 +7,51 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
   const [currentTime, setCurrentTime] = useState(0);
   const [editPlan, setEditPlan] = useState(null);
   const [sceneIndex, setSceneIndex] = useState(null);
+  const [videoList, setVideoList] = useState([]);
   const [currentClipIndex, setCurrentClipIndex] = useState(0);
+  const [currentVideoIndex, setCurrentVideoIndex] = useState(0);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   
-  const videoRef = useRef(null);
+  const videoRefs = useRef({});  // Multiple video elements
   const audioRef = useRef(null);
   const animationFrameRef = useRef(null);
   const lastClipIndexRef = useRef(-1);
   
   const isReady = projectStatus?.has_edit_plan;
 
-  // Load edit plan
+  // Load project videos
+  useEffect(() => {
+    if (isReady && videoList.length === 0) {
+      loadVideoList();
+    }
+  }, [isReady]);
+
+  // Load edit plan and scene index
   useEffect(() => {
     if (isReady && !editPlan) {
       loadEditPlan();
     }
   }, [isReady]);
 
-  // Load scene index
   useEffect(() => {
     if (isReady && !sceneIndex) {
       loadSceneIndex();
     }
   }, [isReady]);
+
+  const loadVideoList = async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:5000/projects/${projectName}/videos`);
+      const data = await response.json();
+      if (data.success) {
+        console.log('📹 Video list loaded:', data.videos.length, 'videos');
+        setVideoList(data.videos);
+      }
+    } catch (err) {
+      console.error('Failed to load video list:', err);
+    }
+  };
 
   const loadEditPlan = async () => {
     try {
@@ -58,7 +79,6 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
     }
   };
 
-  // Get current clip based on timeline position
   const getCurrentClip = (timelineTime) => {
     if (!editPlan) return null;
     
@@ -69,7 +89,6 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       }
     }
     
-    // If past the end, return last clip
     if (timelineTime >= editPlan[editPlan.length - 1].end) {
       return null;
     }
@@ -77,61 +96,64 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
     return null;
   };
 
-  // CRITICAL: Calculate video timecode from scene index
   const getVideoTimecode = (clip, timelineTime) => {
-    if (!clip || !sceneIndex) return 0;
+    if (!clip || !sceneIndex) return { videoIndex: 0, time: 0 };
     
     const sceneId = clip.scene_id;
-    if (sceneId === null || sceneId === undefined) return 0;
+    if (sceneId === null || sceneId === undefined) {
+      return { videoIndex: 0, time: 0 };
+    }
     
-    // Find scene in index
     const scene = sceneIndex.find(s => s.id === sceneId);
     if (!scene) {
       console.warn(`⚠️ Scene ${sceneId} not found in index`);
-      return 0;
+      return { videoIndex: 0, time: 0 };
     }
     
-    // Calculate offset within THIS clip's timeline
     const clipOffset = timelineTime - clip.start;
-    
-    // MAGIC: Map to source video timecode
     const videoTime = scene.start_time + clipOffset;
     
-    return videoTime;
+    return {
+      videoIndex: scene.video_index,  // NEW: which video
+      time: videoTime
+    };
   };
 
-  // Main playback engine using requestAnimationFrame
+  // Main playback engine
   useEffect(() => {
-    if (!isPlaying || !editPlan || !sceneIndex || !videoRef.current || !audioRef.current) {
+    if (!isPlaying || !editPlan || !sceneIndex || !audioRef.current || videoList.length === 0) {
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
       return;
     }
 
-    console.log('▶️ Starting NLE playback engine');
+    console.log('▶️ Starting multi-video NLE playback engine');
     
     let lastTime = performance.now();
     let accumulatedTime = currentTime;
     
     const tick = (now) => {
-      const deltaTime = (now - lastTime) / 1000; // Convert to seconds
+      const deltaTime = (now - lastTime) / 1000;
       lastTime = now;
       
       accumulatedTime += deltaTime;
       
       const totalDuration = editPlan[editPlan.length - 1]?.end || 0;
       
-      // Check if finished
       if (accumulatedTime >= totalDuration) {
         console.log('⏹️ Playback finished');
         setIsPlaying(false);
         setCurrentTime(0);
         setCurrentClipIndex(0);
+        setCurrentVideoIndex(0);
         lastClipIndexRef.current = -1;
         
-        // Reset video and audio
-        if (videoRef.current) videoRef.current.currentTime = 0;
+        // Reset all videos
+        Object.values(videoRefs.current).forEach(video => {
+          if (video) video.currentTime = 0;
+        });
+        
         if (audioRef.current) audioRef.current.currentTime = 0;
         
         return;
@@ -139,43 +161,46 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       
       setCurrentTime(accumulatedTime);
       
-      // Find current clip
       const current = getCurrentClip(accumulatedTime);
       
       if (current) {
-        // Detect clip change
         if (current.index !== lastClipIndexRef.current) {
           console.log(`🎬 CLIP CHANGE: ${lastClipIndexRef.current + 1} → ${current.index + 1}`);
-          console.log(`   Scene: ${current.clip.scene_id}`);
-          console.log(`   Phrase: "${current.clip.phrase}"`);
           
           setCurrentClipIndex(current.index);
           lastClipIndexRef.current = current.index;
           
-          // CRITICAL: Jump video to new scene
-          const newVideoTime = getVideoTimecode(current.clip, accumulatedTime);
-          console.log(`   ⚡ Seeking video: ${newVideoTime.toFixed(2)}s`);
+          const { videoIndex, time } = getVideoTimecode(current.clip, accumulatedTime);
+          console.log(`   Scene: ${current.clip.scene_id} from Video ${videoIndex}`);
+          console.log(`   ⚡ Seeking to ${time.toFixed(2)}s`);
           
-          if (videoRef.current) {
-            videoRef.current.currentTime = newVideoTime;
+          // Switch to correct video
+          if (videoIndex !== currentVideoIndex) {
+            console.log(`   🔄 Switching from Video ${currentVideoIndex} → Video ${videoIndex}`);
+            setCurrentVideoIndex(videoIndex);
+          }
+          
+          const videoEl = videoRefs.current[videoIndex];
+          if (videoEl) {
+            videoEl.currentTime = time;
           }
         } else {
-          // Same clip - smooth video playback
-          const targetVideoTime = getVideoTimecode(current.clip, accumulatedTime);
+          // Same clip - smooth playback
+          const { videoIndex, time: targetVideoTime } = getVideoTimecode(current.clip, accumulatedTime);
+          const videoEl = videoRefs.current[videoIndex];
           
-          if (videoRef.current) {
-            const currentVideoTime = videoRef.current.currentTime;
+          if (videoEl) {
+            const currentVideoTime = videoEl.currentTime;
             const drift = Math.abs(currentVideoTime - targetVideoTime);
             
-            // Only seek if drift is significant (>0.3s)
             if (drift > 0.3) {
               console.log(`   🔧 Correcting drift: ${drift.toFixed(2)}s`);
-              videoRef.current.currentTime = targetVideoTime;
+              videoEl.currentTime = targetVideoTime;
             }
           }
         }
         
-        // Sync audio to timeline
+        // Sync audio
         if (audioRef.current) {
           const audioDrift = Math.abs(audioRef.current.currentTime - accumulatedTime);
           if (audioDrift > 0.2) {
@@ -194,35 +219,38 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [isPlaying, editPlan, sceneIndex, currentTime]);
+  }, [isPlaying, editPlan, sceneIndex, currentTime, videoList]);
 
-  // Play/Pause controls
   const togglePlay = async () => {
-    if (!videoRef.current || !audioRef.current || !editPlan || !sceneIndex) return;
+    if (!audioRef.current || !editPlan || !sceneIndex || videoList.length === 0) return;
     
     if (!isPlaying) {
       try {
-        // Sync before starting
         const current = getCurrentClip(currentTime);
         if (current) {
-          const videoTime = getVideoTimecode(current.clip, currentTime);
-          videoRef.current.currentTime = videoTime;
-          audioRef.current.currentTime = currentTime;
+          const { videoIndex, time } = getVideoTimecode(current.clip, currentTime);
           
-          console.log(`▶️ Starting playback at timeline ${currentTime.toFixed(2)}s`);
-          console.log(`   Video: ${videoTime.toFixed(2)}s (scene ${current.clip.scene_id})`);
+          const videoEl = videoRefs.current[videoIndex];
+          if (videoEl) {
+            videoEl.currentTime = time;
+            await videoEl.play();
+          }
+          
+          audioRef.current.currentTime = currentTime;
+          await audioRef.current.play();
+          
+          setCurrentVideoIndex(videoIndex);
+          setIsPlaying(true);
+          
+          console.log(`▶️ Starting playback from Video ${videoIndex} at ${time.toFixed(2)}s`);
         }
-        
-        await Promise.all([
-          videoRef.current.play(),
-          audioRef.current.play()
-        ]);
-        setIsPlaying(true);
       } catch (err) {
         console.error('Playback error:', err);
       }
     } else {
-      videoRef.current.pause();
+      Object.values(videoRefs.current).forEach(video => {
+        if (video) video.pause();
+      });
       audioRef.current.pause();
       setIsPlaying(false);
       console.log('⏸️ Playback paused');
@@ -238,11 +266,14 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       audioRef.current.currentTime = newTime;
     }
     
-    // Update video position
     const current = getCurrentClip(newTime);
-    if (current && videoRef.current) {
-      const videoTime = getVideoTimecode(current.clip, newTime);
-      videoRef.current.currentTime = videoTime;
+    if (current) {
+      const { videoIndex, time } = getVideoTimecode(current.clip, newTime);
+      const videoEl = videoRefs.current[videoIndex];
+      if (videoEl) {
+        videoEl.currentTime = time;
+        setCurrentVideoIndex(videoIndex);
+      }
     }
   };
 
@@ -254,11 +285,14 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       audioRef.current.currentTime = newTime;
     }
     
-    // Update video position
     const current = getCurrentClip(newTime);
-    if (current && videoRef.current) {
-      const videoTime = getVideoTimecode(current.clip, newTime);
-      videoRef.current.currentTime = videoTime;
+    if (current) {
+      const { videoIndex, time } = getVideoTimecode(current.clip, newTime);
+      const videoEl = videoRefs.current[videoIndex];
+      if (videoEl) {
+        videoEl.currentTime = time;
+        setCurrentVideoIndex(videoIndex);
+      }
     }
   };
 
@@ -275,15 +309,18 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
       audioRef.current.currentTime = newTime;
     }
     
-    // Seek video to correct scene
     const current = getCurrentClip(newTime);
-    if (current && videoRef.current) {
-      const videoTime = getVideoTimecode(current.clip, newTime);
-      videoRef.current.currentTime = videoTime;
-      setCurrentClipIndex(current.index);
-      lastClipIndexRef.current = current.index;
+    if (current) {
+      const { videoIndex, time } = getVideoTimecode(current.clip, newTime);
+      const videoEl = videoRefs.current[videoIndex];
+      if (videoEl) {
+        videoEl.currentTime = time;
+        setCurrentVideoIndex(videoIndex);
+        setCurrentClipIndex(current.index);
+        lastClipIndexRef.current = current.index;
+      }
       
-      console.log(`⏭️ Seeked to ${newTime.toFixed(2)}s (clip ${current.index + 1})`);
+      console.log(`⏭️ Seeked to ${newTime.toFixed(2)}s (Video ${videoIndex}, clip ${current.index + 1})`);
     }
   };
 
@@ -321,6 +358,18 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
         preload="auto"
       />
       
+      {/* Hidden video elements for each video */}
+      {videoList.map(video => (
+        <video
+          key={video.index}
+          ref={el => videoRefs.current[video.index] = el}
+          src={`http://127.0.0.1:5000/projects/${projectName}/video/${video.index}`}
+          preload="auto"
+          muted
+          style={{ display: 'none' }}
+        />
+      ))}
+      
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-lg font-semibold">Preview</h3>
         {isReady && (
@@ -345,17 +394,21 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
           </div>
         ) : showPlayer ? (
           <div className="relative w-full h-full bg-black">
-            {/* Video Element */}
-            <video 
-              ref={videoRef}
-              src={`http://127.0.0.1:5000/projects/${projectName}/movie.mp4`}
-              className="w-full h-full object-contain"
-              muted
-              preload="auto"
-              onError={(e) => {
-                console.error('Video load error:', e);
-              }}
-            />
+            {/* Active Video Display */}
+            {videoList.map(video => (
+              <video
+                key={`display-${video.index}`}
+                ref={el => {
+                  if (el && !videoRefs.current[video.index]) {
+                    videoRefs.current[video.index] = el;
+                  }
+                }}
+                src={`http://127.0.0.1:5000/projects/${projectName}/video/${video.index}`}
+                className={`w-full h-full object-contain ${video.index === currentVideoIndex ? 'block' : 'hidden'}`}
+                muted
+                preload="auto"
+              />
+            ))}
             
             {/* Subtitle Overlay */}
             {currentClip && (
@@ -384,12 +437,8 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
             <div className="absolute top-2 right-2 bg-black bg-opacity-70 px-3 py-2 rounded text-xs text-white font-mono">
               <div>Clip: {currentClipIndex + 1}/{editPlan?.length || 0}</div>
               <div>Scene: {currentClip?.scene_id ?? 'N/A'}</div>
+              <div>Video: {currentVideoIndex + 1}/{videoList.length}</div>
               <div>Timeline: {formatTime(currentTime)}</div>
-              {currentClip && sceneIndex && (
-                <div className="text-green-400">
-                  Video: {formatTime(getVideoTimecode(currentClip, currentTime))}
-                </div>
-              )}
             </div>
           </div>
         ) : (
@@ -400,6 +449,9 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
             />
             <p className="text-gray-400 text-sm">
               Click to open player
+            </p>
+            <p className="text-gray-500 text-xs mt-2">
+              {videoList.length} video{videoList.length !== 1 ? 's' : ''} indexed
             </p>
           </div>
         )}
@@ -435,7 +487,6 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               className="h-full bg-blue-500 rounded-full transition group-hover:bg-blue-400"
               style={{ width: `${progressPercent}%` }}
             />
-            {/* Scrubber */}
             <div 
               className="absolute top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full shadow-lg opacity-0 group-hover:opacity-100 transition"
               style={{ left: `${progressPercent}%`, transform: 'translate(-50%, -50%)' }}
@@ -460,7 +511,7 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
               
               <button
                 onClick={togglePlay}
-                disabled={!sceneIndex}
+                disabled={!sceneIndex || videoList.length === 0}
                 className="p-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:cursor-not-allowed rounded-full transition"
               >
                 {isPlaying ? (
@@ -508,13 +559,7 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
           {/* Current Clip Info */}
           {currentClip && (
             <div className="text-xs text-gray-500 text-center">
-              Scene {currentClip.scene_id} • Clip {currentClipIndex + 1} of {editPlan?.length}
-            </div>
-          )}
-          
-          {!sceneIndex && (
-            <div className="text-xs text-yellow-500 text-center">
-              ⚠️ Loading scene index...
+              Scene {currentClip.scene_id} • Video {currentVideoIndex + 1} • Clip {currentClipIndex + 1}/{editPlan?.length}
             </div>
           )}
         </div>
@@ -526,6 +571,13 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
           <span className="text-gray-400">Project:</span>
           <span className="text-white font-medium">{projectName}</span>
         </div>
+        
+        {videoList.length > 0 && (
+          <div className="flex items-center justify-between">
+            <span className="text-gray-400">Videos:</span>
+            <span className="text-white font-medium">{videoList.length}</span>
+          </div>
+        )}
         
         <div className="flex items-center justify-between">
           <span className="text-gray-400">Status:</span>
@@ -541,36 +593,13 @@ export default function VideoPreview({ projectName, projectStatus, progress }) {
                 Pipeline Status
               </div>
               <div className="space-y-2">
-                <StatusItem
-                  label="Transcript"
-                  completed={projectStatus.has_transcript}
-                />
-                <StatusItem
-                  label="Video Indexed"
-                  completed={projectStatus.has_frames && projectStatus.has_embeddings}
-                />
-                <StatusItem
-                  label="Scenes Analyzed"
-                  completed={projectStatus.has_characters}
-                />
-                <StatusItem
-                  label="Edit Plan"
-                  completed={projectStatus.has_edit_plan}
-                />
+                <StatusItem label="Transcript" completed={projectStatus.has_transcript} />
+                <StatusItem label="Video Indexed" completed={projectStatus.has_frames && projectStatus.has_embeddings} />
+                <StatusItem label="Scenes Analyzed" completed={projectStatus.has_characters} />
+                <StatusItem label="Edit Plan" completed={projectStatus.has_edit_plan} />
               </div>
             </div>
           </>
-        )}
-
-        {/* Warning if files missing */}
-        {projectStatus && (!projectStatus.has_video || !projectStatus.has_audio) && (
-          <div className="flex items-start gap-2 p-3 bg-yellow-900 bg-opacity-20 border border-yellow-800 rounded-lg">
-            <AlertCircle className="w-4 h-4 text-yellow-500 flex-shrink-0 mt-0.5" />
-            <div className="text-xs text-yellow-300">
-              {!projectStatus.has_video && <div>Missing: movie.mp4</div>}
-              {!projectStatus.has_audio && <div>Missing: voice.mp3</div>}
-            </div>
-          </div>
         )}
       </div>
     </div>
