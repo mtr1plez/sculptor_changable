@@ -41,29 +41,6 @@ def get_video_info(video_path: str) -> Dict:
     }
 
 
-def get_audio_info(audio_path: str) -> Dict:
-    """
-    Получает информацию об аудио файле
-    
-    Args:
-        audio_path: Путь к аудио
-    
-    Returns:
-        Словарь с параметрами аудио
-    """
-    cap = cv2.VideoCapture(audio_path)
-    
-    if cap.isOpened():
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30  # fallback
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps if fps > 0 else 0
-        cap.release()
-        return {'duration': duration, 'fps': fps}
-    
-    # Fallback: берем из последнего элемента edit_plan
-    return {'duration': 0, 'fps': 30}
-
-
 def load_scene_index(cache_dir: Path) -> List[Dict]:
     """Загружает индекс сцен"""
     index_file = cache_dir / "scene_index.json"
@@ -75,24 +52,45 @@ def load_scene_index(cache_dir: Path) -> List[Dict]:
         return json.load(f)
 
 
+def load_project_manifest(project_root: Path) -> Dict:
+    """Загружает манифест проекта для получения списка видео"""
+    manifest_file = project_root / "project.json"
+    
+    if not manifest_file.exists():
+        # Legacy project - одно видео
+        return {
+            "videos": [{
+                "index": 0,
+                "filename": "movie.mp4",
+                "original_name": "movie.mp4"
+            }]
+        }
+    
+    with open(manifest_file, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
 def create_premiere_xml(edit_plan: List[Dict], scene_index: List[Dict], 
-                        video_info: Dict, video_path: str, audio_path: str) -> str:
+                        video_infos: Dict[int, Dict], video_paths: Dict[int, str],
+                        audio_path: str) -> str:
     """
     Создаёт Final Cut Pro 7 XML (совместимый с Premiere Pro)
     
     Args:
         edit_plan: План монтажа
         scene_index: Индекс сцен
-        video_info: Информация о видео
-        video_path: Путь к исходному видео
+        video_infos: {video_index: info} - информация о каждом видео
+        video_paths: {video_index: path} - пути к видеофайлам
         audio_path: Путь к аудио озвучки
     
     Returns:
         XML строка
     """
-    fps = int(video_info['fps'])
-    width = video_info['width']
-    height = video_info['height']
+    # Используем параметры первого видео для последовательности
+    first_video = video_infos[0]
+    fps = int(first_video['fps'])
+    width = first_video['width']
+    height = first_video['height']
     
     # Создаём карту scene_id -> scene
     scene_map = {scene['id']: scene for scene in scene_index}
@@ -160,13 +158,14 @@ def create_premiere_xml(edit_plan: List[Dict], scene_index: List[Dict],
     audio_track_1 = SubElement(audio, 'track')
     audio_track_2 = SubElement(audio, 'track')
     
-    # Добавляем видео клипы
-    # ВАЖНО: используем точные временные метки из транскрипта для синхронизации
+    # ====================================================================
+    # ВИДЕО КЛИПЫ - с поддержкой множественных видео
+    # ====================================================================
     
     for i, item in enumerate(edit_plan):
         scene_id = item.get('scene_id')
-        phrase_start = item['start']  # Точное время начала фразы в аудио
-        phrase_end = item['end']      # Точное время конца фразы в аудио
+        phrase_start = item['start']
+        phrase_end = item['end']
         phrase_duration = phrase_end - phrase_start
         
         # Конвертируем в кадры
@@ -179,11 +178,20 @@ def create_premiere_xml(edit_plan: List[Dict], scene_index: List[Dict],
             continue
         
         scene = scene_map[scene_id]
+        video_index = scene.get('video_index', 0)  # Индекс видео из сцены
+        
+        # Проверяем что видео существует
+        if video_index not in video_paths:
+            print(f"⚠️ Видео {video_index} не найдено для сцены {scene_id}")
+            continue
+        
+        video_path = video_paths[video_index]
+        video_info = video_infos[video_index]
         
         # Видео клип
         clip = SubElement(video_track, 'clipitem', id=f"clipitem-{i+1}")
-        SubElement(clip, 'masterclipid').text = f"masterclip-{scene_id}"
-        SubElement(clip, 'name').text = f"Scene_{scene_id}"
+        SubElement(clip, 'masterclipid').text = f"masterclip-video{video_index}-scene{scene_id}"
+        SubElement(clip, 'name').text = f"Video{video_index}_Scene{scene_id}"
         
         # Enabled
         SubElement(clip, 'enabled').text = 'TRUE'
@@ -194,7 +202,7 @@ def create_premiere_xml(edit_plan: List[Dict], scene_index: List[Dict],
         SubElement(clip_rate, 'timebase').text = str(fps)
         SubElement(clip_rate, 'ntsc').text = 'FALSE'
         
-        # Входная/выходная точка в исходнике (берем из середины сцены)
+        # Входная/выходная точка в исходнике
         scene_in_frames = int(scene['start_time'] * fps)
         scene_out_frames = scene_in_frames + phrase_frames
         
@@ -204,8 +212,10 @@ def create_premiere_xml(edit_plan: List[Dict], scene_index: List[Dict],
         SubElement(clip, 'in').text = str(scene_in_frames)
         SubElement(clip, 'out').text = str(scene_out_frames)
         
-        # File reference
-        file_elem = SubElement(clip, 'file', id=f"file-{scene_id}")
+        # ====================================================================
+        # КРИТИЧЕСКИЙ FIX: Уникальный file reference для каждого видео
+        # ====================================================================
+        file_elem = SubElement(clip, 'file', id=f"file-video{video_index}-scene{scene_id}")
         SubElement(file_elem, 'name').text = os.path.basename(video_path)
         SubElement(file_elem, 'pathurl').text = f"file://localhost/{os.path.abspath(video_path).replace(chr(92), '/')}"
         
@@ -225,10 +235,12 @@ def create_premiere_xml(edit_plan: List[Dict], scene_index: List[Dict],
         SubElement(fsc_rate, 'timebase').text = str(fps)
         SubElement(fsc_rate, 'ntsc').text = 'FALSE'
         
-        SubElement(fsc, 'width').text = str(width)
-        SubElement(fsc, 'height').text = str(height)
+        SubElement(fsc, 'width').text = str(video_info['width'])
+        SubElement(fsc, 'height').text = str(video_info['height'])
     
-    # Аудио клип (вся озвучка) - привязан к точному времени
+    # ====================================================================
+    # АУДИО КЛИП (вся озвучка)
+    # ====================================================================
     total_audio_frames = int(edit_plan[-1]['end'] * fps)
     
     for track_idx, audio_track in enumerate([audio_track_1, audio_track_2]):
@@ -283,23 +295,19 @@ def export_to_premiere():
     cfg = load_config()
     
     cache_dir = Path(cfg['paths']['cache_dir'])
+    project_root = Path(cfg['paths']['project_root'])
     edit_plan_file = cache_dir / "edit_plan.json"
     output_xml = Path(cfg['paths']['output_video']).parent / "premiere_project.xml"
     
-    video_path = cfg['paths']['input_video']
     audio_path = cfg['paths']['input_audio']
     
-    print("🎬 SculptorPro - XML Exporter\n")
+    print("🎬 SculptorPro - XML Exporter (Multi-video)\n")
     print("="*60)
     
     # Проверка файлов
     if not edit_plan_file.exists():
         print(f"❌ План монтажа не найден: {edit_plan_file}")
         print("   Запусти сначала: python src/smart_matcher.py")
-        return
-    
-    if not os.path.exists(video_path):
-        print(f"❌ Исходное видео не найдено: {video_path}")
         return
     
     if not os.path.exists(audio_path):
@@ -314,16 +322,43 @@ def export_to_premiere():
     
     scene_index = load_scene_index(cache_dir)
     
+    # Загружаем манифест проекта
+    manifest = load_project_manifest(project_root)
+    
     print(f"   ✅ План монтажа: {len(edit_plan)} фраз")
     print(f"   ✅ Индекс сцен: {len(scene_index)} сцен")
+    print(f"   ✅ Видео в проекте: {len(manifest['videos'])}")
     
-    # Получаем информацию о видео
-    print("\n🎥 Анализируем видео...")
-    video_info = get_video_info(video_path)
+    # ====================================================================
+    # Собираем информацию о всех видео
+    # ====================================================================
+    videos_dir = project_root / 'input' / 'videos'
     
-    print(f"   Разрешение: {video_info['width']}x{video_info['height']}")
-    print(f"   FPS: {video_info['fps']:.2f}")
-    print(f"   Длительность: {video_info['duration']:.1f}s")
+    video_infos = {}
+    video_paths = {}
+    
+    for video_info in manifest['videos']:
+        video_index = video_info['index']
+        video_filename = video_info['filename']
+        video_path = videos_dir / video_filename
+        
+        if not video_path.exists():
+            print(f"⚠️ Видео не найдено: {video_path}")
+            continue
+        
+        print(f"\n🎥 Анализируем видео {video_index}: {video_filename}")
+        info = get_video_info(str(video_path))
+        
+        print(f"   Разрешение: {info['width']}x{info['height']}")
+        print(f"   FPS: {info['fps']:.2f}")
+        print(f"   Длительность: {info['duration']:.1f}s")
+        
+        video_infos[video_index] = info
+        video_paths[video_index] = str(video_path)
+    
+    if not video_infos:
+        print("\n❌ Не найдено ни одного видео!")
+        return
     
     # Создание XML
     print("\n📝 Генерируем Final Cut Pro 7 XML...")
@@ -331,8 +366,8 @@ def export_to_premiere():
     xml_content = create_premiere_xml(
         edit_plan, 
         scene_index, 
-        video_info, 
-        video_path, 
+        video_infos,
+        video_paths,
         audio_path
     )
     
@@ -342,6 +377,7 @@ def export_to_premiere():
     
     print(f"\n✅ XML проект создан: {output_xml}")
     print(f"   Клипов на таймлайне: {len(edit_plan)}")
+    print(f"   Использовано видео: {len(video_infos)}")
     print(f"   Общая длительность: {edit_plan[-1]['end']:.1f}s")
     
     print("\n📌 Как импортировать в Premiere Pro:")
@@ -354,7 +390,8 @@ def export_to_premiere():
     print("   File → Import → Final Cut Pro XML...")
     
     print("\n⚠️ Важно: Исходные файлы должны быть доступны:")
-    print(f"   📹 {video_path}")
+    for video_index, video_path in video_paths.items():
+        print(f"   📹 Video {video_index}: {video_path}")
     print(f"   🎤 {audio_path}")
 
 
